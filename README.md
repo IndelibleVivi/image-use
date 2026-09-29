@@ -158,6 +158,7 @@ Gallery packages can be characters too — `xiaohei` is one.
 - 🎨 **[Style gallery](https://drawstyle.leeguoo.com)** — browse and contribute community art styles.
 - 📝 **[Deep dive (blog)](https://blog.leeguoo.com/en/posts/chatgpt-imagegen/)** — the design and principles behind it.
 - ⚙️ **[How it works](./docs/how-it-works.md)** · **[HTTP API wrapper](https://github.com/leeguooooo/agent-cli-to-api)**
+- 🚀 Releasing: `scripts/release.sh <version> "<whatsnew>"` (`--dry-run` to preview) bumps the version, tests, pushes `main`, waits for the CI-created Release, then syncs the plugin marketplace.
 
 ## License
 
