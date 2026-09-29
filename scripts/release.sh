@@ -4,6 +4,11 @@
 # so Claude Code plugin installs pick the new version up right away (no token: uses your `gh` login).
 #   scripts/release.sh [--dry-run] 0.30.1 "one-line what's new (shown in the update reminder)"
 set -eu
+run_ok() {  # run_ok <run-id> [-R owner/repo]: wait until the run completes (gh run watch can drop on a network error), then require success
+  _r=$1; shift
+  until [ "$(gh run view "$_r" "$@" --json status -q .status 2>/dev/null)" = completed ]; do gh run watch "$_r" "$@" >/dev/null 2>&1 || sleep 15; done
+  [ "$(gh run view "$_r" "$@" --json conclusion -q .conclusion)" = success ]
+}
 DRY=
 [ "${1:-}" = --dry-run ] && { DRY=1; shift; }
 V=${1:?usage: scripts/release.sh [--dry-run] <version> <whatsnew>}
@@ -47,7 +52,7 @@ i=0
 until RUN=$(gh run list -R "$REPO" -w ci.yml -c "$SHA" -L 1 --json databaseId -q '.[0].databaseId') && [ -n "$RUN" ]; do
   i=$((i + 1)); [ "$i" -lt 60 ] || { echo "error: no CI run for $SHA" >&2; exit 1; }; sleep 5
 done
-gh run watch "$RUN" -R "$REPO" --exit-status >/dev/null || { echo "error: CI run $RUN failed; no release" >&2; exit 1; }
+run_ok "$RUN" -R "$REPO" || { echo "error: CI run $RUN failed; no release" >&2; exit 1; }
 i=0
 until gh release view "v$V" -R "$REPO" >/dev/null 2>&1; do
   i=$((i + 1)); [ "$i" -lt 60 ] || { echo "error: release v$V did not appear; check release.yml" >&2; exit 1; }; sleep 5
@@ -58,6 +63,6 @@ echo "released v$V"
 gh workflow run auto-sync-versions.yml -R "$MARKETPLACE"
 sleep 5
 RUN=$(gh run list -R "$MARKETPLACE" -w auto-sync-versions.yml -e workflow_dispatch -L 1 --json databaseId -q '.[0].databaseId')
-gh run watch "$RUN" -R "$MARKETPLACE" --exit-status >/dev/null && echo "marketplace synced" || echo "warn: marketplace sync run $RUN failed; the hourly run will retry"
+run_ok "$RUN" -R "$MARKETPLACE" && echo "marketplace synced" || echo "warn: marketplace sync run $RUN failed; the hourly run will retry"
 gh api "repos/$MARKETPLACE/contents/.claude-plugin/marketplace.json" -q .content | base64 -d \
   | python3 -c "import json,sys; print('marketplace image-use:', next(p['version'] for p in json.load(sys.stdin)['plugins'] if p['name']=='image-use'))"
