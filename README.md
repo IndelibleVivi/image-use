@@ -119,6 +119,14 @@ an existing draft is preserved. A run that stops before sending clears the text
 it pasted; if a run still reports a non-empty composer, clear the box at
 chatgpt.com — ChatGPT restores unsent drafts in new chats.
 
+After sending, the web backend waits up to `--timeout` for a fresh image confirmed
+in two consecutive page reads. Assistant text or a missing Stop control does not
+prove image generation has finished. Already-detected rate-limit dialogs still
+stop the run immediately; text-only replies, refusals, and quota messages in the
+reply body without a recognized limit signal wait until the deadline. On timeout,
+check the original conversation before retrying: the image may still appear there,
+and `auto` does not fall back to Codex after submission.
+
 ## Community styles
 
 Browse and reuse art styles other people tuned — a public gallery at **[drawstyle.leeguoo.com](https://drawstyle.leeguoo.com)**. No script update needed:
