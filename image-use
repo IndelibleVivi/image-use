@@ -2443,6 +2443,26 @@ def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
                        f"repeated to avoid duplicate requests{detail}. Check the conversation.")
 
 
+def _web_terminal_reply(text: str) -> str | None:
+    """Recognize explicit English reply prefixes, not incidental limit mentions.
+
+    The caller uses this only without streaming or a fresh image. Keep it narrow:
+    vague retry text and temporary "not yet" replies are not completion signals.
+    """
+    text = " ".join(text.split())
+    if re.match(r"you(?:['’]ve| have) (?:hit|reached) (?:the|your) "
+                r"image (?:generation|creation) limit\b", text, re.I):
+        return "quota"
+    if re.match(r"(?:(?:i(?:['’]m| am) sorry|sorry)[,.!]?\s*(?:but\s+)?)?"
+                r"i (?:can(?:not|['’]t)|am unable to) "
+                r"(?:(?:generate|create) (?:that|this) image|"
+                r"help with (?:that|this) (?:image )?request)"
+                r"(?:[.!](?:\s|$)|$|[,;]?\s+(?:because|due to|as it|under)\b)",
+                text, re.I):
+        return "refusal"
+    return None
+
+
 def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit,
                          refs=None):
     """Upload references, submit verified text once, and download the new image."""
@@ -2482,12 +2502,13 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
     state_js = _JS_STATE % (json.dumps(baseline), json.dumps(WEB_IMG_SRC_RE),
                             _js_state_selectors())
     last_phase = ""
+    last_atext = ""
     final_src: str | None = None
     stable_src: str | None = None
     # Assistant content and a missing Stop control do not prove that the image
     # task has finished: generation/rendering may outlive the text turn. Wait
-    # for a confirmed image or the original deadline, unless the existing
-    # rate-limit detector reports a limit.
+    # for a confirmed image or the original deadline, unless a recognized
+    # rate-limit dialog or explicit terminal reply reports failure.
     while time.monotonic() < deadline:
         time.sleep(2.0)
         try:
@@ -2498,6 +2519,10 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
         if not isinstance(st, dict):
             stable_src = None
             continue
+        reply = st.get("atext")
+        atext = reply.strip()[:240] if isinstance(reply, str) else ""
+        if atext:
+            last_atext = atext
         if st.get("limited"):
             # Post-submit rate limit: a plain GatewayError on purpose — the
             # prompt already went in, so auto mode must NOT double-spend by
@@ -2526,12 +2551,24 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
             # A missing image interrupts consecutive confirmation, just like
             # streaming, a failed page read, or an invalid state above.
             stable_src = None
+            terminal = _web_terminal_reply(atext) if st.get("assistant") else None
+            if terminal:
+                reason = ("ChatGPT reported an image-generation limit."
+                          if terminal == "quota" else
+                          "ChatGPT declined the image request.")
+                # Keep this a plain post-submit error: auto must not replay it.
+                raise GatewayError(
+                    reason + f" ChatGPT said: {json.dumps(atext, ensure_ascii=False)}. "
+                    "The prompt was already submitted; check the conversation before retrying."
+                )
 
     if not final_src:
+        detail = (f" ChatGPT said: {json.dumps(last_atext, ensure_ascii=False)}."
+                  if last_atext else "")
         raise GatewayError(
             f"timed out after {args.timeout}s waiting to confirm the image "
-            f"(last phase: {last_phase or 'connecting'}). "
-            "The prompt was already submitted; check the conversation before retrying."
+            f"(last phase: {last_phase or 'connecting'})." + detail +
+            " The prompt was already submitted; check the conversation before retrying."
         )
 
     emit("downloading image bytes")
