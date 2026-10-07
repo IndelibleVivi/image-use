@@ -3793,5 +3793,460 @@ class WebGenerateBlobDownload(unittest.TestCase):
         self.assertIn(json.dumps(blob), evals[-1])
 
 
+class _FakeClock:
+    """One monotonic clock driving monotonic(), sleep() and remaining().
+
+    No wall-clock time passes and no browser/provider is touched: the poll loop
+    in ``_generate_in_browser`` advances only by the sleeps it requests, so a
+    test can assert exactly *when* (in fake seconds) a branch fired.
+    """
+
+    def __init__(self, deadline: float) -> None:
+        """Start the fake run at t=0 with ``deadline`` fake seconds of budget."""
+        self.now = 0.0
+        self.deadline = deadline
+
+    def monotonic(self) -> float:
+        """Stand in for ``time.monotonic``: fake seconds since the run started."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Advance the fake clock; the poll loop's only source of time."""
+        self.now += seconds
+
+    def remaining(self) -> float:
+        """Mirror production's ``max(2.0, deadline - now)`` read-timeout budget."""
+        return max(2.0, self.deadline - self.now)
+
+
+class WebGenerateWait(unittest.TestCase):
+    """The poll loop in ``_generate_in_browser`` after a prompt is submitted.
+
+    Assistant text without an image is not a reliable terminal signal. These
+    pin the original deadline, the interruption reset, and the
+    post-submit error routing that keeps auto mode off the Codex bucket.
+    """
+
+    def setUp(self):
+        """Fresh call recorders; success tests set ``fetch_result`` themselves."""
+        self.submitted = []
+        self.fetched = []
+        # Success tests provide the page's download response.
+        self.fetch_result = None
+
+    def _run(self, states, *, deadline):
+        """Drive ``_generate_in_browser`` over ``states`` with a fake clock.
+
+        ``states`` is a list of return values for the ``_JS_STATE`` poll; an
+        entry may be an exception raised by ``_ab_eval``. The baseline and
+        ``_JS_FETCH`` evals are handled separately so neither consumes a state poll.
+
+        The fake clock starts at zero and ``args.timeout`` is derived from the
+        deadline, mirroring production where the two describe the same budget
+        (``deadline = monotonic() + args.timeout``).
+        """
+        clock = _FakeClock(deadline)
+        self.clock = clock
+        state_iter = iter(states)
+
+        def fake_eval(ab, js, session, timeout):
+            """Route each page eval: baseline, download, or the next poll state.
+
+            This is the mocked browser boundary — ``_ab_eval`` never runs JS, so
+            the test feeds the exact state dicts (or raised errors) the poll loop
+            would have observed, and records any download attempt in ``fetched``.
+            """
+            if js.startswith(cig._JS_BASELINE.split("%s")[0]):
+                return []  # nothing on the page before we submitted
+            if js.startswith(cig._JS_FETCH.split("%s")[0]):
+                self.fetched.append(js)
+                return self.fetch_result
+            self.assertTrue(js.startswith(cig._JS_STATE.split("%s")[0]))
+            try:
+                item = next(state_iter)
+            except StopIteration:
+                item = states[-1]
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        def fake_submit(*a, **kw):
+            """Stand in for the one-shot composer submission; records the call."""
+            self.submitted.append((a, kw))
+
+        args = argparse.Namespace(timeout=deadline)
+        with unittest.mock.patch.object(cig, "_ab_eval", side_effect=fake_eval), \
+             unittest.mock.patch.object(cig, "_submit_web_prompt", side_effect=fake_submit), \
+             unittest.mock.patch.object(cig.time, "sleep", clock.sleep), \
+             unittest.mock.patch.object(cig.time, "monotonic", clock.monotonic):
+            result = cig._generate_in_browser(
+                "ab", "s", "prompt", args, clock.deadline, clock.remaining,
+                lambda _: None)
+        return clock, result
+
+    def test_ten_idle_polls_then_two_equal_fresh_blobs_succeed(self):
+        """Ten no-image polls must not fail early; two equal fresh reads settle it."""
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        blob = "blob:https://chatgpt.com/00000000-0000-0000-0000-0000000000aa"
+        self.fetch_result = {
+            "ok": True, "type": "image/png",
+            "b64": base64.b64encode(png).decode(),
+        }
+        idle = {"stop": False, "last": None, "assistant": True,
+                "limited": False, "atext": "编辑"}
+        fresh = dict(idle, last=blob)
+        # Ten consecutive no-image polls would trip the old IDLE_LIMIT=8 error
+        # long before the two fresh reads that actually settle the image.
+        clock, (data, meta) = self._run([idle] * 10 + [fresh, fresh], deadline=300.0)
+
+        self.assertEqual(data, png)
+        self.assertEqual(meta, {"content_type": "image/png", "source": "web"})
+        # 12 sleeps (ten idle + the two reads that accept the src) at 2s each.
+        self.assertEqual(clock.now, 24.0)
+        self.assertEqual(len(self.submitted), 1)
+        self.assertEqual(len(self.fetched), 1)
+        self.assertIn(json.dumps(blob), self.fetched[0])
+
+    def _assert_timeout(self, atext, label):
+        """Assert an image-less run errors on the ORIGINAL deadline, never earlier.
+
+        The message must be a plain GatewayError naming the budget, the
+        already-submitted reminder and the conversation, with no download.
+        """
+        with self.subTest(assistant_text=label):
+            # Isolate call counts for each spelling.
+            self.submitted, self.fetched = [], []
+            idle = {"stop": False, "last": None, "assistant": True,
+                    "limited": False, "atext": atext}
+            # An integer 300s budget — exactly what argparse hands production —
+            # and 2s polls ⇒ 150 sleeps, landing exactly on 300.0.
+            with self.assertRaises(cig.GatewayError) as ctx:
+                self._run([idle] * 200, deadline=300)
+            # The timeout must fire on the ORIGINAL deadline — not an idle
+            # early-error — and report that budget verbatim.
+            self.assertEqual(self.clock.now, 300.0)
+            self.assertNotIsInstance(ctx.exception, cig.WebUnavailable)
+            msg = str(ctx.exception)
+            self.assertIn("timed out after 300s", msg)
+            self.assertRegex(msg, r"(?i)already submitted")
+            self.assertIn("conversation", msg.lower())
+            self.assertEqual(len(self.submitted), 1)
+            self.assertEqual(self.fetched, [])
+
+    def test_always_no_image_times_out_at_the_original_deadline(self):
+        """A page that never yields an image errors only when the budget runs out."""
+        self._assert_timeout("", "empty")
+
+    def test_ordinary_quota_wording_is_not_broadly_detected(self):
+        """A quoted/incidental quota mention must not be read as a terminal reply.
+
+        The narrow terminal contract covers a leading English quota prefix, not
+        any body text that merely *mentions* a limit. ``limited=False`` models
+        a page without a recognized rate-limit dialog.
+        """
+        self._assert_timeout(
+            'The help page says, "You\'ve reached your image generation '
+            'limit", so try again later.',
+            "quoted quota mention")
+
+    def test_first_poll_rate_limit_raises_plain_gateway_error(self):
+        """The existing limited=True dialog still fails on the first poll."""
+        limited = {"stop": False, "last": None, "assistant": True,
+                   "limited": True, "atext": ""}
+        with self.assertRaises(cig.GatewayError) as ctx:
+            self._run([limited], deadline=300.0)
+        # Immediately after the first 2s sleep — no second poll.
+        self.assertEqual(self.clock.now, 2.0)
+        self.assertNotIsInstance(ctx.exception, cig.WebUnavailable)
+        self.assertEqual(len(self.submitted), 1)
+        self.assertEqual(self.fetched, [])
+
+    def _assert_terminal_body(self, body, label, *, needle, invented_reset=False):
+        """A recognized terminal reply must fail on the first poll at 2s.
+
+        Plain GatewayError (never WebUnavailable), exactly one submission and no
+        download, ChatGPT's own (bounded) wording echoed back, and the
+        already-submitted / check-conversation reminder.
+        """
+        state = {"stop": False, "last": None, "assistant": True,
+                 "limited": False, "atext": body}
+        with self.subTest(assistant_text=label):
+            # Several bodies share this method; isolate each subtest's calls.
+            self.submitted, self.fetched = [], []
+            with self.assertRaises(cig.GatewayError) as ctx:
+                self._run([state], deadline=300)
+            # Immediately after the first 2s sleep — no second poll.
+            self.assertEqual(self.clock.now, 2.0)
+            self.assertNotIsInstance(ctx.exception, cig.WebUnavailable)
+            msg = str(ctx.exception)
+            self.assertIn(needle, msg)
+            self.assertRegex(msg, r"(?i)already submitted")
+            self.assertIn("conversation", msg.lower())
+            if invented_reset:
+                # The body names no reset, so the error must not invent one.
+                self.assertNotIn("reset", msg.lower())
+            self.assertEqual(len(self.submitted), 1)
+            self.assertEqual(self.fetched, [])
+
+    def test_first_poll_quota_body_raises_plain_gateway_error(self):
+        """A narrow English quota prefix in the reply is terminal on poll one.
+
+        Straight and curly apostrophes and "image creation" wording are covered;
+        ChatGPT's own (bounded) words ride along and no reset timing is invented.
+        """
+        for body, label, needle in (
+            ("You've hit the image generation limit. Upgrade to Plus for more.",
+             "hit-limit straight apostrophe", "hit the image generation limit"),
+            ("You’ve reached your image generation limit for now.",
+             "reached-limit curly apostrophe", "reached your image generation limit"),
+            ("You’ve hit your image creation limit.",
+             "image creation wording", "image creation limit"),
+        ):
+            self._assert_terminal_body(
+                body, label, needle=needle, invented_reset=True)
+
+    def test_first_poll_refusal_body_raises_plain_gateway_error(self):
+        """Explicit refusals are terminal on the first poll, same routing."""
+        for body, label, needle in (
+            ("I can't generate that image.", "cannot-generate",
+             "can't generate that image"),
+            ("I'm sorry, but I cannot create this image because it may violate "
+             "our content policy.", "sorry-cannot-create",
+             "I cannot create this image"),
+            ("I can't help with that request.", "cannot-help",
+             "can't help with that request"),
+        ):
+            self._assert_terminal_body(body, label, needle=needle)
+
+    def test_ambiguous_replies_stay_non_terminal(self):
+        """Only a narrow leading prefix is terminal — these bodies are not.
+
+        "try again later" alone, a body that stops short ("...yet"), and text
+        carrying no leading prefix must all fall through to the original-deadline
+        timeout rather than erroring early.
+        """
+        self._assert_timeout("Please try again later.", "try-again-later only")
+        self._assert_timeout("I can't generate that image yet; give me a moment.",
+                             "refusal prefix with a trailing clause")
+        self._assert_timeout("I have created the image you asked for.",
+                             "ordinary prose mentioning creation")
+
+    def test_terminal_wording_on_a_non_assistant_turn_is_ignored(self):
+        """Terminal-looking text only counts on the current assistant turn.
+
+        ``assistant=False`` means nothing from the model has rendered yet, so the
+        body must not be read as a terminal reply — the run falls through to the
+        unchanged original-deadline timeout.
+        """
+        idle = {"stop": False, "last": None, "assistant": False,
+                "limited": False,
+                "atext": "You've hit the image generation limit."}
+        with self.assertRaises(cig.GatewayError) as ctx:
+            self._run([idle] * 200, deadline=300)
+        self.assertEqual(self.clock.now, 300.0)
+        self.assertNotIsInstance(ctx.exception, cig.WebUnavailable)
+        self.assertIn("timed out after 300s", str(ctx.exception))
+
+    def test_streaming_and_fresh_image_take_precedence_over_body_text(self):
+        """A body heuristic never fires while the turn is streaming or has an image.
+
+        First the turn is still streaming (``stop=True``) with terminal-looking
+        text; then a fresh image is present (``last`` set) with the same text.
+        Neither may be terminal — the run succeeds once the blob is confirmed twice.
+        """
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        self.fetch_result = {
+            "ok": True, "type": "image/png",
+            "b64": base64.b64encode(png).decode(),
+        }
+        blob = "blob:https://chatgpt.com/00000000-0000-0000-0000-0000000000bb"
+        terminal_text = "You've hit the image generation limit."
+        streaming = {"stop": True, "last": None, "assistant": True,
+                     "limited": False, "atext": terminal_text}
+        fresh = {"stop": False, "last": blob, "assistant": True,
+                 "limited": False, "atext": terminal_text}
+        clock, (data, meta) = self._run([streaming, fresh, fresh], deadline=300.0)
+        self.assertEqual(data, png)
+        self.assertEqual(meta, {"content_type": "image/png", "source": "web"})
+        # streaming + two fresh reads = three 2s sleeps; never a terminal error.
+        self.assertEqual(clock.now, 6.0)
+        self.assertEqual(len(self.submitted), 1)
+        self.assertEqual(len(self.fetched), 1)
+        self.assertIn(json.dumps(blob), self.fetched[0])
+
+    def test_delayed_success_beyond_90_seconds_is_not_cut_short(self):
+        """A slow generation settling past 90s still needs its two fresh reads.
+
+        There is no fixed idle cutoff: 46 no-image polls (92s) must not error,
+        and the run succeeds only when the same new blob is seen twice in a row.
+        """
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        self.fetch_result = {
+            "ok": True, "type": "image/png",
+            "b64": base64.b64encode(png).decode(),
+        }
+        blob = "blob:https://chatgpt.com/00000000-0000-0000-0000-0000000000cc"
+        idle = {"stop": False, "last": None, "assistant": True,
+                "limited": False, "atext": ""}
+        fresh = dict(idle, last=blob)
+        clock, (data, meta) = self._run([idle] * 46 + [fresh, fresh], deadline=300.0)
+        self.assertEqual(data, png)
+        self.assertEqual(meta, {"content_type": "image/png", "source": "web"})
+        # 46 idle + 2 accepting polls = 48 sleeps, i.e. 96s — beyond any 90s cutoff.
+        self.assertEqual(clock.now, 96.0)
+        self.assertEqual(len(self.submitted), 1)
+        self.assertEqual(len(self.fetched), 1)
+
+    def test_timeout_reports_last_nonempty_assistant_text(self):
+        """The timeout diagnostic carries the last nonempty assistant text.
+
+        That text must survive empty polls, a malformed state, a failed page read
+        and a non-string ``atext`` (which must not crash) — and reappear in the
+        final message so the user can see what the model actually said.
+        """
+        kept = "Here is a description of the image I made earlier."
+        states = [
+            {"stop": False, "last": None, "assistant": True,
+             "limited": False, "atext": kept},
+            {"stop": False, "last": None, "assistant": True,
+             "limited": False, "atext": ""},
+            "malformed-state",
+            cig.GatewayError("transient eval failure"),
+            {"stop": False, "last": None, "assistant": True,
+             "limited": False, "atext": None},
+            {"stop": False, "last": None, "assistant": True,
+             "limited": False, "atext": 12345},
+        ] + [{"stop": False, "last": None, "assistant": True,
+              "limited": False, "atext": ""}] * 200
+        with self.assertRaises(cig.GatewayError) as ctx:
+            self._run(states, deadline=300)
+        self.assertEqual(self.clock.now, 300.0)
+        self.assertNotIsInstance(ctx.exception, cig.WebUnavailable)
+        msg = str(ctx.exception)
+        self.assertIn("timed out after 300s", msg)
+        self.assertIn(kept, msg)
+
+    def test_timeout_assistant_text_is_bounded(self):
+        """The echoed assistant body in the timeout diagnostic is capped at 240 chars."""
+        long_text = "x" * 300
+        states = [{"stop": False, "last": None, "assistant": True,
+                   "limited": False, "atext": long_text}] \
+            + [{"stop": False, "last": None, "assistant": True,
+                "limited": False, "atext": ""}] * 200
+        with self.assertRaises(cig.GatewayError) as ctx:
+            self._run(states, deadline=300)
+        msg = str(ctx.exception)
+        self.assertIn("x" * 240, msg)
+        self.assertNotIn("x" * 241, msg)
+
+    def test_stop_interruption_resets_then_accepts_new_src(self):
+        """A still-streaming (stop=True) read breaks confirmation of the old src."""
+        self._check_interruption({"stop": True, "last": None, "assistant": True,
+                                  "limited": False, "atext": ""}, "stop=True")
+
+    def test_no_image_interruption_resets_then_accepts_new_src(self):
+        """A no-image read breaks confirmation, so a later src is re-read twice."""
+        self._check_interruption({"stop": False, "last": None, "assistant": True,
+                                  "limited": False, "atext": ""}, "no-image")
+
+    def test_gateway_error_interruption_resets_then_accepts_new_src(self):
+        """A failed page read counts as an interruption, not a confirmed src."""
+        self._check_interruption(cig.GatewayError("transient eval failure"),
+                                 "GatewayError")
+
+    def test_invalid_non_dict_state_interruption_resets_then_accepts(self):
+        """A malformed state read counts as an interruption, not a confirmed src."""
+        self._check_interruption("not-a-dict", "invalid-state")
+
+    def _check_interruption(self, interruption, label):
+        """An A -> interruption -> A -> B -> B run must accept B, never A."""
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        self.fetch_result = {
+            "ok": True, "type": "image/png",
+            "b64": base64.b64encode(png).decode(),
+        }
+        a = "blob:https://chatgpt.com/aaaaaaaa"
+        b = "blob:https://chatgpt.com/bbbbbbbb"
+        base = {"stop": False, "assistant": True, "limited": False, "atext": ""}
+        states = [dict(base, last=a), interruption, dict(base, last=a),
+                  dict(base, last=b), dict(base, last=b)]
+        with self.subTest(interruption=label):
+            clock, (data, meta) = self._run(states, deadline=300.0)
+            self.assertEqual(clock.now, 10.0)
+            self.assertEqual(data, png)
+            self.assertEqual(meta, {"content_type": "image/png", "source": "web"})
+            self.assertEqual(len(self.submitted), 1)
+            self.assertEqual(len(self.fetched), 1)
+            self.assertIn(json.dumps(b), self.fetched[0])
+            self.assertNotIn(json.dumps(a), self.fetched[0])
+
+    def test_auto_does_not_fall_back_to_codex_after_submit(self):
+        """auto + a real post-submit error must exit, never run codex.
+
+        End-to-end over the real ``_generate_in_browser``: ``run_web`` is the only
+        provider seam mocked, and it invokes ``self._run`` over the chosen states
+        so the *actual* GatewayError (timeout, direct quota body, or direct
+        refusal body) propagates into the real ``_dispatch``. Locks/slots and the
+        codex-token probe are stubbed so no disk/network/account is touched.
+
+        Even with a Codex token "available", the prompt was already submitted, so
+        falling back would silently double-spend the metered bucket auto mode
+        exists to protect.
+        """
+        idle = {"stop": False, "last": None, "assistant": True,
+                "limited": False, "atext": ""}
+        quota_body = "You've hit the image generation limit. Upgrade to Plus for more."
+        refusal_body = ("I'm sorry, but I cannot create this image because it may "
+                        "violate our content policy.")
+
+        def _noop_lock(*a, **k):
+            """Replace the cross-tool/slot lock with an uncontended stub."""
+            @contextmanager
+            def _cm():
+                """Yield at once, standing in for a lock that is free."""
+                yield
+            return _cm()
+
+        # (label, poll states, expected fake failure second, message needle)
+        cases = (
+            ("timeout", [idle] * 200, 300.0, "timed out after 300s"),
+            ("direct quota body",
+             [dict(idle, atext=quota_body)], 2.0, quota_body),
+            ("direct refusal body",
+             [dict(idle, atext=refusal_body)], 2.0, refusal_body),
+        )
+        for label, states, expected_at, needle in cases:
+            with self.subTest(after_submit=label):
+                # Fresh per-subtest call record; `_run` installs the fake clock.
+                self.submitted, self.fetched = [], []
+                self.fetch_result = None
+                args = argparse.Namespace(
+                    backend="auto", resolved_refs=None, ref=None,
+                    quality=None, background=None, moderation=None)
+                with unittest.mock.patch.object(cig, "_codex_only_options", return_value=[]), \
+                     unittest.mock.patch.object(cig, "_chatgpt_web_turn", _noop_lock), \
+                     unittest.mock.patch.object(cig, "_concurrency_slot", _noop_lock), \
+                     unittest.mock.patch.object(cig, "_backend_limit", return_value=1), \
+                     unittest.mock.patch.object(cig, "_codex_token_present", return_value=True), \
+                     unittest.mock.patch.object(
+                         cig, "run_web",
+                         side_effect=lambda *a, **k: self._run(states, deadline=300)), \
+                     unittest.mock.patch.object(cig, "run_codex") as run_codex:
+                    with self.assertRaises(SystemExit) as ctx:
+                        cig._dispatch(args, False, 300.0, 0.0)
+                run_codex.assert_not_called()
+                msg = str(ctx.exception)
+                # The real failure reached _dispatch and its original text survived.
+                self.assertIn(needle, msg)
+                self.assertRegex(msg, r"(?i)already submitted")
+                self.assertIn("conversation", msg.lower())
+                self.assertIn("did not fall back to codex", msg)
+                # One prompt went in, no download, and the poll stopped exactly at
+                # the real deadline (300s timeout, or the first 2s terminal poll).
+                self.assertEqual(self.clock.now, expected_at)
+                self.assertEqual(len(self.submitted), 1)
+                self.assertEqual(self.fetched, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -119,6 +119,19 @@ an existing draft is preserved. A run that stops before sending clears the text
 it pasted; if a run still reports a non-empty composer, clear the box at
 chatgpt.com — ChatGPT restores unsent drafts in new chats.
 
+After sending, the web backend waits up to `--timeout` for a fresh image confirmed
+in two consecutive page reads. Assistant text or a missing Stop control does not
+prove image generation has finished. Detected rate-limit dialogs stop the run
+immediately. When no image or streaming control is present, explicit English
+reply prefixes such as "You've hit the image generation limit" or "I can't
+generate that image." also fail immediately. Quoted mentions, vague "try again
+later" text, and unrecognized replies keep waiting until the deadline; this is
+not a complete quota/refusal detector for every wording or language. Timeout and
+recognized reply-body errors include assistant text (up to 240 characters);
+timeouts retain the last nonempty text through interrupted page reads.
+On timeout, check the original conversation before retrying: the image may still
+appear there, and `auto` does not fall back to Codex after submission.
+
 ## Community styles
 
 Browse and reuse art styles other people tuned — a public gallery at **[drawstyle.leeguoo.com](https://drawstyle.leeguoo.com)**. No script update needed:
