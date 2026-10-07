@@ -80,9 +80,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-        run: >-
-          gh release create "v${VERSION}"
-          --repo "$GITHUB_REPOSITORY"
-          --target "$TARGET_SHA"
-          --title "v${VERSION}"
-          --generate-notes
+        # Notes come from the repo (WHATSNEW line, commits, contributors):
+        # --generate-notes only lists merged PRs, and most releases here are
+        # direct pushes, which left a bare "Full Changelog" link.
+        run: |
+          python scripts/release-notes.py "$VERSION" "$TARGET_SHA" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          gh release create "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "v${VERSION}" \
+            --notes-file "$RUNNER_TEMP/notes.md"
