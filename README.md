@@ -124,6 +124,13 @@ when that fallback would be unwanted. It requires a non-empty target and
 `--backend web` or `auto`, verifies Project identity after opening and again in
 a capture guard on the native Send click, and disables Codex fallback even when
 the browser is unavailable. `IMAGE_USE_PROJECT` can supply either a name or URL.
+Use `--no-require-project` to override the environment default for one run,
+restoring best-effort routing and ordinary backend/fallback rules without
+changing the exported variable.
+
+Required-mode failures before Send retain the current draft for inspection.
+Inspect it in ChatGPT and manually clear the composer before the next run;
+ChatGPT can restore unsent drafts in new chats.
 
 ```bash
 image-use "a watercolor cat" --project "Art" --require-project --keep-conversation
@@ -141,9 +148,7 @@ Incomplete uploads or altered text stop the run. If a send cannot be confirmed,
 it reports the uncertainty without sending again. Start with an empty composer;
 an existing draft is preserved. A run that stops before sending clears the text
 it pasted, except in required Project mode: it preserves the current draft for
-inspection because the route or draft ownership may have changed. If a run
-still reports a non-empty composer, clear the box at
-chatgpt.com — ChatGPT restores unsent drafts in new chats.
+inspection because the route or draft ownership may have changed.
 
 After sending, the web backend waits up to `--timeout` for a fresh image confirmed
 in two consecutive page reads. Assistant text or a missing Stop control does not

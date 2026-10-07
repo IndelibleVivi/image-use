@@ -6670,11 +6670,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--require-project",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=_env_bool("IMAGE_USE_REQUIRE_PROJECT"),
         help="Require a non-empty --project and verified Project routing before Send. "
              "Only web/auto; disables Codex fallback. Does not imply --keep-conversation. "
-             "Also IMAGE_USE_REQUIRE_PROJECT=1.",
+             "Also IMAGE_USE_REQUIRE_PROJECT=1; --no-require-project overrides it for one run.",
     )
     parser.add_argument(
         "--web-model",

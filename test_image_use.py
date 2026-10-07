@@ -4532,6 +4532,7 @@ class RequiredProjectSubmission(unittest.TestCase):
                             _composer_state(user_turns=1)]
 
         def page(ab, js, **kw):
+            """Return route and guard receipts while recording evaluated scripts."""
             self.evals.append(js)
             if js == cig._JS_PROJECT_ID:
                 return project_id if project is None else project
@@ -4541,6 +4542,7 @@ class RequiredProjectSubmission(unittest.TestCase):
             return result if result is not None else {"ok": True}
 
         def command(*args, **kw):
+            """Record native transport calls and optionally lose the click response."""
             self.calls.append((args, kw))
             if click_error and args[1] == "click":
                 raise cig.GatewayError("native click outcome unknown")
@@ -4555,11 +4557,13 @@ class RequiredProjectSubmission(unittest.TestCase):
                                    required_project_id=project_id)
 
     def test_wrong_project_stops_before_paste(self):
+        """A mismatched Project never receives the prompt or a Send click."""
         with self.assertRaisesRegex(cig.GatewayError, "required"):
             self._run(project="g-p-ffffffffffffffffffffffffffffffff")
         self.assertEqual(self.calls, [])
 
     def test_guard_refusal_or_unreadable_arm_prevents_native_click_and_preserves_draft(self):
+        """Failed guard setup retains the pasted draft and never clicks Send."""
         for result in ({"ok": False, "error": "Project route changed"},
                        {}, cig.GatewayError("guard setup outcome unknown")):
             with self.subTest(result=result), self.assertRaisesRegex(cig.GatewayError, "Draft retained"):
@@ -4568,6 +4572,7 @@ class RequiredProjectSubmission(unittest.TestCase):
             self.assertTrue(any(js.startswith("JSON.stringify(window[") for js in self.evals))
 
     def test_click_time_guard_refusal_stops_without_draft_cleanup_or_replay(self):
+        """A blocked native event leaves the current draft and is never retried."""
         with self.assertRaisesRegex(cig.GatewayError, "Draft retained"):
             self._run(guarded={"ok": False, "error": "Project route changed"})
         self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
@@ -4579,6 +4584,7 @@ class RequiredProjectSubmission(unittest.TestCase):
         self.assertEqual([a[1] for a, _ in self.calls], ["fill"])
 
     def test_correct_project_has_one_native_send_to_the_marked_button(self):
+        """One native click targets only the button carrying this guard token."""
         self._run()
         self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
         selector = self.calls[-1][0][2]
@@ -4587,10 +4593,12 @@ class RequiredProjectSubmission(unittest.TestCase):
         self.assertIn(selector.split('"')[1], arm_js)
 
     def test_uncertain_native_click_observes_receipt_without_replay(self):
+        """A lost click response can be confirmed without a second Send."""
         self._run(click_error=True)
         self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
 
     def test_uncertain_send_without_receipt_stops_without_replay_or_draft_cleanup(self):
+        """Missing receipts cannot justify resending or clearing the current draft."""
         for outcome in ({}, cig.GatewayError("guard receipt unknown")):
             with self.subTest(outcome=outcome), \
                  self.assertRaisesRegex(cig.GatewayError, "Send was not repeated"):
@@ -4598,6 +4606,7 @@ class RequiredProjectSubmission(unittest.TestCase):
             self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
 
     def test_existing_draft_is_untouched_in_required_mode(self):
+        """An existing draft prevents both prompt paste and Send."""
         with self.assertRaisesRegex(cig.GatewayError, "not empty"):
             self._run(states=[_composer_state("existing draft")])
         self.assertEqual(self.calls, [])
@@ -4607,6 +4616,7 @@ class RequiredProjectSubmission(unittest.TestCase):
         prompt = "first\n\nUnicode 猫 — $() `text`\n" * 6000
         calls = []
         def ab(*args, **kw):
+            """Emulate encoded browser responses and record long-script stdin use."""
             calls.append((args, kw))
             if args[1] == "click":
                 return ""
@@ -4730,6 +4740,7 @@ class RequiredProjectIntegration(unittest.TestCase):
     """Carry resolved identity through run_web, with retention independently controlled."""
 
     def test_run_web_passes_required_identity_and_respects_retention_flags(self):
+        """Resolved identity reaches generation while retention controls deletion."""
         from contextlib import ExitStack
         for required, keep, keep_tab in ((True, False, False), (True, True, False),
                                         (True, False, True), (False, False, False)):
@@ -4755,6 +4766,7 @@ class RequiredProjectIntegration(unittest.TestCase):
                 self.assertEqual(delete.call_count, int(not keep and not keep_tab))
 
     def test_required_route_failure_stops_before_reference_resolution_or_upload(self):
+        """Route rejection prevents reference work and prompt submission."""
         with unittest.mock.patch.object(cig, "_ab_eval", return_value=None), \
              unittest.mock.patch.object(cig, "_resolve_ref_path") as resolve, \
              unittest.mock.patch.object(cig, "_upload_references") as upload, \
@@ -4774,10 +4786,17 @@ class RequiredProjectIntegration(unittest.TestCase):
             ({"IMAGE_USE_REQUIRE_PROJECT": "1"}, [], True, False),
             ({"CHATGPT_IMAGEGEN_REQUIRE_PROJECT": "1"}, [], True, False),
             ({"IMAGE_USE_REQUIRE_PROJECT": "0", "CHATGPT_IMAGEGEN_REQUIRE_PROJECT": "1"}, [], False, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "1"}, ["--no-require-project"], False, False),
+            ({"CHATGPT_IMAGEGEN_REQUIRE_PROJECT": "1"}, ["--no-require-project"], False, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "0"}, ["--require-project"], True, False),
+            ({}, ["--require-project", "--no-require-project"], False, False),
+            ({}, ["--no-require-project", "--require-project"], True, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "1"}, ["--no-require-project", "--keep-conversation"], False, True),
             ({}, ["--require-project", "--keep-conversation"], True, True),
         ):
             args_seen = []
             def record_args(parser, argv):
+                """Record real parser output before any styles or backend work."""
                 args = parse_args(parser, argv)
                 args_seen.append(args)
                 return args
@@ -4794,7 +4813,38 @@ class RequiredProjectIntegration(unittest.TestCase):
             self.assertEqual(args_seen[0].require_project, expected)
             self.assertEqual(args_seen[0].keep_conversation, keep)
 
+    def test_cli_opt_out_allows_plain_chat_or_non_web_backend_without_changing_env(self):
+        """A per-run opt-out passes validation while the exported default stays on."""
+        parse_args = argparse.ArgumentParser.parse_args
+        for env_name in ("IMAGE_USE_REQUIRE_PROJECT", "CHATGPT_IMAGEGEN_REQUIRE_PROJECT"):
+            for backend, project in (("web", ""), ("auto", ""), ("codex", "Art"),
+                                     ("gemini", "Art"), ("agy", "Art")):
+                args_seen = []
+                def record_args(parser, argv):
+                    """Observe the actual CLI parser without bypassing validation."""
+                    args = parse_args(parser, argv)
+                    args_seen.append(args)
+                    return args
+                with self.subTest(env=env_name, backend=backend, project=project), \
+                     unittest.mock.patch.dict(os.environ, {env_name: "1"}, clear=True), \
+                     unittest.mock.patch.object(sys, "argv", ["image-use", "prompt",
+                         "--no-require-project", "--backend", backend, "--project", project]), \
+                     unittest.mock.patch.object(cig, "_should_check_for_update", return_value=False), \
+                     unittest.mock.patch.object(argparse.ArgumentParser, "parse_args",
+                         autospec=True, side_effect=record_args), \
+                     unittest.mock.patch.object(cig, "_load_styles",
+                         side_effect=RuntimeError("parser checkpoint")), \
+                     unittest.mock.patch.object(cig, "_dispatch") as dispatch:
+                    with self.assertRaisesRegex(RuntimeError, "parser checkpoint"):
+                        cig.main()
+                    self.assertEqual(os.environ[env_name], "1")
+                    self.assertFalse(args_seen[0].require_project)
+                    self.assertEqual(args_seen[0].backend, backend)
+                    self.assertEqual(args_seen[0].project, project)
+                    dispatch.assert_not_called()
+
     def test_cli_invalid_route_stops_before_styles_or_backend(self):
+        """Invalid required targets and backends fail before downstream work."""
         for flags in (["--require-project", "--project", ""],
                       ["--require-project", "--backend", "codex"],
                       ["--project", "https://example.com/project"]):
@@ -4815,6 +4865,7 @@ class RequiredProjectDispatch(unittest.TestCase):
     """The real dispatch boundary rejects incompatible backends and fallbacks."""
 
     def setUp(self):
+        """Provide a valid required-Project request for dispatch boundary tests."""
         self.args = argparse.Namespace(backend="auto", project="Art", require_project=True,
                                       ref=None, resolved_refs=None)
 
@@ -4833,6 +4884,7 @@ class RequiredProjectDispatch(unittest.TestCase):
             yield calls
 
     def test_required_unavailable_web_never_reads_codex_token_or_falls_back(self):
+        """Unavailable web stops required mode before Codex credentials or calls."""
         with self._backends(cig.WebUnavailable("relay offline")) as calls:
             with self.assertRaisesRegex(SystemExit, "required"):
                 cig._dispatch(self.args, False, 300, 0)
@@ -4852,6 +4904,7 @@ class RequiredProjectDispatch(unittest.TestCase):
                     call.assert_not_called()
 
     def test_required_generation_error_does_not_suggest_codex(self):
+        """Required-mode failures never recommend switching to Codex."""
         with self._backends(cig.GatewayError("required Project changed")) as calls:
             with self.assertRaises(SystemExit) as error:
                 cig._dispatch(self.args, False, 300, 0)
