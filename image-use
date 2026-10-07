@@ -67,13 +67,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.30.2"
+__version__ = "0.31.0"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.31.0]: 新增 image-use recover <会话链接>:web 超时后图晚到也能直接下载,不用重新提交;超时报错会给出会话链接和这条命令(需要 chrome-use site update 装上 chatgpt/images)
 # WHATSNEW[0.30.2]: web 后端出图不再在约 16 秒无图后误报失败:同一张新图连续两次读到才算完成,否则等满 --timeout;正文以英文额度/拒绝提示开头时立即报错;报错附上 ChatGPT 原话并提醒先看原会话再重试(#44)
 # WHATSNEW[0.30.1]: web 后端适配 ChatGPT 2026-09 改版界面:新的输入框、发送按钮(含中文等本地化标签)、轮次标记(整段对话渲染两次也只算一次)和 blob: 图片地址(在页面内取回字节),旧界面照常可用(#41)
 # WHATSNEW[0.30.0]: 按 *-use 家族约定升级——`image-use upgrade`(`update` 仍可用)按安装方式装最新 GitHub Release 并刷新各处 skill,`--check`/`--json` 只查不改;每天一次的新版提示改为 stderr 一行,以 GitHub Release 为准,CI / USE_NO_UPDATE_CHECK / IMAGE_USE_NO_UPDATE_CHECK 可关闭;不再在后台自动升级
