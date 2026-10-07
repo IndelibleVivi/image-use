@@ -130,7 +130,17 @@ not a complete quota/refusal detector for every wording or language. Timeout and
 recognized reply-body errors include assistant text (up to 240 characters);
 timeouts retain the last nonempty text through interrupted page reads.
 On timeout, check the original conversation before retrying: the image may still
-appear there, and `auto` does not fall back to Codex after submission.
+appear there, and `auto` does not fall back to Codex after submission. The error
+names the conversation; once the image shows up, collect it without prompting
+again:
+
+```bash
+image-use recover https://chatgpt.com/c/<id> -o out.png
+```
+
+`recover` uses the `chatgpt/images` adapter from
+[chrome-use-sites](https://github.com/leeguooooo/chrome-use-sites) (`chrome-use site update`
+installs it) and the same single chatgpt.com tab and lock as a web run.
 
 ## Community styles
 

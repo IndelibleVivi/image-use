@@ -22,6 +22,7 @@ import json
 import os
 import re
 import ssl
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -3833,6 +3834,7 @@ class WebGenerateWait(unittest.TestCase):
         self.fetched = []
         # Success tests provide the page's download response.
         self.fetch_result = None
+        self.conv_url = "https://chatgpt.com/c/6aa20b3f-c6fc-83e8-9007-e1e3d3a8eb3d"
 
     def _run(self, states, *, deadline):
         """Drive ``_generate_in_browser`` over ``states`` with a fake clock.
@@ -3861,6 +3863,8 @@ class WebGenerateWait(unittest.TestCase):
             if js.startswith(cig._JS_FETCH.split("%s")[0]):
                 self.fetched.append(js)
                 return self.fetch_result
+            if js == cig._JS_CONV_URL:
+                return self.conv_url  # the tab's /c/<id>, for the recover hint
             self.assertTrue(js.startswith(cig._JS_STATE.split("%s")[0]))
             try:
                 item = next(state_iter)
@@ -4046,6 +4050,9 @@ class WebGenerateWait(unittest.TestCase):
         self.assertEqual(self.clock.now, 300.0)
         self.assertNotIsInstance(ctx.exception, cig.WebUnavailable)
         self.assertIn("timed out after 300s", str(ctx.exception))
+        # The conversation is named with the command that collects its image
+        # later, so a slow image costs a download rather than a second prompt.
+        self.assertIn("image-use recover " + self.conv_url, str(ctx.exception))
 
     def test_streaming_and_fresh_image_take_precedence_over_body_text(self):
         """A body heuristic never fires while the turn is streaming or has an image.
@@ -4246,6 +4253,160 @@ class WebGenerateWait(unittest.TestCase):
                 self.assertEqual(self.clock.now, expected_at)
                 self.assertEqual(len(self.submitted), 1)
                 self.assertEqual(self.fetched, [])
+
+
+
+class WebRecoverHint(unittest.TestCase):
+    """Post-submit failures name the conversation only when the tab has one."""
+
+    def test_no_conversation_url_means_no_hint(self):
+        """A tab still on / (nothing sent) or an unreadable tab adds nothing."""
+        for value in (None, cig.GatewayError("eval failed")):
+            with self.subTest(value=value), unittest.mock.patch.object(
+                    cig, "_ab_eval",
+                    side_effect=value if isinstance(value, Exception) else None,
+                    return_value=value):
+                self.assertEqual(cig._recover_hint("ab", "s"), "")
+
+
+class SiteCall(unittest.TestCase):
+    """``_site_call`` reads chrome-use's --json envelope, success or not."""
+
+    def _proc(self, stdout, rc=0, stderr=""):
+        """A finished chrome-use process with the given output."""
+        return subprocess.CompletedProcess([], rc, stdout=stdout, stderr=stderr)
+
+    def test_returns_the_adapter_result(self):
+        """The adapter's value lives at data.result, after any stray lines."""
+        env = {"success": True, "data": {"result": {"count": 1}}}
+        with unittest.mock.patch.object(
+                cig.subprocess, "run",
+                return_value=self._proc("site adapters for chatgpt.com\n" + json.dumps(env))) as run:
+            self.assertEqual(cig._site_call("ab", "chatgpt/images", ["x"], "chatgpt-web", 60), {"count": 1})
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["ab", "site", "chatgpt/images", "x"])
+        self.assertIn("--json", cmd)
+        self.assertEqual(cmd[cmd.index("--session") + 1], "chatgpt-web")
+
+    def test_adapter_error_is_carried_into_the_exception(self):
+        """exit 1 with {success:false, error} keeps the adapter's own words."""
+        env = {"success": False, "error": "chatgpt.com rate-limited this account (HTTP 429) — do not poll"}
+        with unittest.mock.patch.object(cig.subprocess, "run", return_value=self._proc(json.dumps(env), rc=1)):
+            with self.assertRaises(cig.GatewayError) as ctx:
+                cig._site_call("ab", "chatgpt/images", ["x"], "s", 60)
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_missing_adapter_points_at_site_update(self):
+        """An adapter pack that predates chatgpt/images says how to get it."""
+        with unittest.mock.patch.object(
+                cig.subprocess, "run",
+                return_value=self._proc("", rc=1, stderr="error: unknown adapter chatgpt/images")):
+            with self.assertRaises(cig.GatewayError) as ctx:
+                cig._site_call("ab", "chatgpt/images", ["x"], "s", 60)
+        self.assertIn("chrome-use site update", str(ctx.exception))
+
+
+class RecoverCommand(unittest.TestCase):
+    """``image-use recover``: collect an existing image, never prompt again."""
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+    URL = "https://chatgpt.com/c/6aa20b3f-c6fc-83e8-9007-e1e3d3a8eb3d"
+
+    def setUp(self):
+        """Run in a scratch dir with the lock, browser and adapter all faked."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        self.evals, self.ab_calls = [], []
+
+        @contextmanager
+        def free_lock(*a, **k):
+            """An uncontended cross-tool chatgpt.com lock."""
+            yield
+
+        def fake_ab(ab, *a, **k):
+            """Record chrome-use subcommands (only `close` is expected)."""
+            self.ab_calls.append(a)
+            return ""
+
+        def fake_eval(ab, js, session, timeout):
+            """Answer the in-page download of a signed URL with PNG bytes."""
+            self.evals.append((js, session))
+            return {"ok": True, "type": "application/octet-stream",
+                    "b64": base64.b64encode(self.PNG).decode()}
+
+        for name, value in (("_find_agent_browser", lambda: "ab"),
+                            ("_chatgpt_web_turn", free_lock),
+                            ("_ab", fake_ab),
+                            ("_ab_eval", fake_eval),
+                            ("_record_last_output", lambda p: None)):
+            patcher = unittest.mock.patch.object(cig, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _recover(self, result, *argv):
+        """Run the subcommand against a canned chatgpt/images result."""
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(cig, "_site_call", return_value=result) as site, \
+             redirect_stdout(out), redirect_stderr(err):
+            rc = cig._recover_command([self.URL, *argv])
+        return rc, out.getvalue(), err.getvalue(), site
+
+    def _image(self, file_id):
+        """One generated image as chatgpt/images reports it."""
+        return {"file_id": file_id, "source": "generated",
+                "download_url": "https://chatgpt.com/backend-api/estuary/content?id=" + file_id}
+
+    def test_downloads_each_image_and_prints_the_paths(self):
+        """Bytes are fetched in the shared tab, typed by sniffing, then the tab closes."""
+        res = {"finished": True, "title": "fox", "images": [self._image("file_a"), self._image("file_b")]}
+        rc, out, err, site = self._recover(res, "-o", "fox.png", "--quiet")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.split(), ["fox.png", "fox-2.png"])
+        self.assertEqual(Path("fox-2.png").read_bytes(), self.PNG)
+        self.assertEqual(site.call_args[0][1:4], ("chatgpt/images", [self.URL], "chatgpt-web"))
+        self.assertTrue(all(s == "chatgpt-web" for _, s in self.evals))
+        self.assertIn("file_b", self.evals[1][0])
+        self.assertEqual(self.ab_calls, [("close",)])
+
+    def test_default_name_comes_from_the_title_and_the_bytes(self):
+        """octet-stream content still lands as .png, named after the chat."""
+        res = {"finished": True, "title": "Red Fox", "images": [self._image("file_a")]}
+        rc, out, _, _ = self._recover(res, "--quiet")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), str(Path("assets/generated/red-fox.png")))
+
+    def test_last_is_passed_to_the_adapter(self):
+        """--last narrows to the latest turn on the server side."""
+        res = {"finished": True, "images": [self._image("file_a")]}
+        _, _, _, site = self._recover(res, "--last", "--quiet")
+        self.assertEqual(site.call_args[0][2], [self.URL, "--last", "true"])
+
+    def test_unfinished_conversation_says_to_wait(self):
+        """No image yet while ChatGPT works is "try later", not "no image"."""
+        rc, out, err, _ = self._recover({"finished": False, "images": []})
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("still working", err)
+        self.assertEqual(self.ab_calls, [("close",)])
+
+    def test_finished_conversation_without_image_fails(self):
+        """A finished chat with nothing generated is a plain failure."""
+        rc, _, err, _ = self._recover({"finished": True, "images": []})
+        self.assertEqual(rc, 1)
+        self.assertIn("no generated image", err)
+
+    def test_adapter_failure_is_reported_and_the_tab_still_closes(self):
+        """A failing adapter never leaves the shared tab open."""
+        with unittest.mock.patch.object(cig, "_site_call",
+                                        side_effect=cig.GatewayError("HTTP 429")), \
+             redirect_stderr(io.StringIO()) as err:
+            rc = cig._recover_command([self.URL])
+        self.assertEqual(rc, 1)
+        self.assertIn("HTTP 429", err.getvalue())
+        self.assertEqual(self.ab_calls, [("close",)])
 
 
 if __name__ == "__main__":

@@ -112,7 +112,16 @@ assistant 正文出现或 Stop 控件缺失,都不能证明图片任务已经结
 也会立即报错。引用中的提示、含糊的 "try again later" 和其他未识别正文仍等待总期限;
 这不是覆盖所有措辞和语言的额度/拒绝检测器。正文识别错误和超时会附上 assistant
 正文(最多 240 字符);超时会保留读取中断前最后一段非空正文。超时后先检查原会话再重试:
-图片仍可能在那里出现,`auto` 也不会在提交后自动改用 Codex。
+图片仍可能在那里出现,`auto` 也不会在提交后自动改用 Codex。报错里会给出会话链接,
+等图出来后用下面的命令直接下载,不用重新提交:
+
+```bash
+image-use recover https://chatgpt.com/c/<id> -o out.png
+```
+
+`recover` 依赖 [chrome-use-sites](https://github.com/leeguooooo/chrome-use-sites) 里的
+`chatgpt/images` adapter(`chrome-use site update` 会装上),和 web 生图共用同一个
+chatgpt.com 标签页和锁。
 
 ## 社区风格
 

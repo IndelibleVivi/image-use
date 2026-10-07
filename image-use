@@ -2464,6 +2464,25 @@ def _web_terminal_reply(text: str) -> str | None:
     return None
 
 
+_JS_CONV_URL = r"""(() => {
+  const m = location.pathname.match(/\/c\/([0-9a-f-]{16,})/i);
+  return JSON.stringify(m ? 'https://chatgpt.com/c/' + m[1] : null);
+})()"""
+
+
+def _recover_hint(ab, session) -> str:
+    """Name the conversation a post-submit failure left behind, and how to
+    collect its image later without prompting again. Best-effort: '' when the
+    tab has no /c/<id> yet or cannot be read."""
+    try:
+        url = _ab_eval(ab, _JS_CONV_URL, session=session, timeout=10.0)
+    except GatewayError:
+        return ""
+    if not isinstance(url, str) or not url:
+        return ""
+    return f" Conversation: {url} — once the image is there: image-use recover {url}"
+
+
 def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit,
                          refs=None):
     """Upload references, submit verified text once, and download the new image."""
@@ -2531,6 +2550,7 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
             raise GatewayError(
                 _RATE_LIMIT_MSG + " The prompt was already submitted; check "
                 "the conversation later or retry in a few minutes."
+                + _recover_hint(ab, session)
             )
         if st.get("stop"):
             if last_phase != "generating":
@@ -2570,6 +2590,7 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
             f"timed out after {args.timeout}s waiting to confirm the image "
             f"(last phase: {last_phase or 'connecting'})." + detail +
             " The prompt was already submitted; check the conversation before retrying."
+            + _recover_hint(ab, session)
         )
 
     emit("downloading image bytes")
@@ -5728,6 +5749,138 @@ def _open_file(path: Path, progress: bool) -> None:
 
 # ---------- main ----------
 
+def _site_call(ab: str, spec: str, site_args: list[str], session: str,
+               timeout: float, profile: str | None = None) -> Any:
+    """Run a chrome-use site adapter and return its result, or raise GatewayError.
+
+    `--json` wraps the adapter's value as {success, data: {result}, error}, and
+    an adapter-level {error, hint} is promoted into that envelope with exit 1,
+    so the message is read from stdout rather than lost to a bare exit code.
+    """
+    cmd = [ab]
+    if profile:
+        cmd += ["--profile", profile]
+    cmd += ["site", spec, *site_args, "--json", "--session", session,
+            "--timeout", f"{int(timeout)}s"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        raise GatewayError(f"chrome-use site {spec} timed out") from None
+    env = None
+    for line in reversed([l for l in proc.stdout.splitlines() if l.strip()]):
+        try:
+            env = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if isinstance(env, dict) and env.get("success"):
+        return (env.get("data") or {}).get("result")
+    detail = (env.get("error") if isinstance(env, dict) else None) or \
+        " / ".join((proc.stderr or proc.stdout).strip().splitlines()[-3:])[:300]
+    if re.search(r"unknown adapter|no adapter|not found", detail or "", re.I):
+        detail += f" — run `chrome-use site update` to install {spec}"
+    raise GatewayError(f"chrome-use site {spec} failed: {detail}")
+
+
+def _recover_command(argv: list[str]) -> int:
+    """`image-use recover <conversation>` — download the image a web run left behind.
+
+    A web run that times out has already spent the prompt; the image often
+    appears in that conversation a minute later. This collects it through the
+    chrome-use-sites `chatgpt/images` adapter (the server's list of the
+    conversation's images, with signed download URLs) instead of prompting again.
+    """
+    parser = argparse.ArgumentParser(
+        prog="image-use recover",
+        description="Download the image(s) ChatGPT generated in an existing "
+                    "conversation, without submitting anything.")
+    parser.add_argument("conversation",
+                        help="https://chatgpt.com/c/<id> URL (or the bare id) "
+                             "named by the timeout error")
+    parser.add_argument("-o", "--out",
+                        help="Output path (several images get -2, -3 … "
+                             "suffixes; default: assets/generated/<title>.<ext>)")
+    parser.add_argument("--last", action="store_true",
+                        help="Only images from the conversation's latest turn")
+    parser.add_argument("--profile", default=None,
+                        help="Chrome profile to use (default: the open Chrome via relay)")
+    parser.add_argument("--timeout", type=_positive_int, default=120,
+                        help="Seconds for the whole recovery (default 120)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Print only the saved path(s)")
+    args = parser.parse_args(argv)
+    progress = not args.quiet
+    start = time.monotonic()
+
+    def emit(msg: str) -> None:
+        if progress:
+            print(_fmt_progress(time.monotonic() - start, msg), file=sys.stderr)
+
+    ab = _find_agent_browser()
+    if ab is None:
+        sys.exit(f"error: `chrome-use` is not installed — {_AB_INSTALL_HINT}")
+    deadline = time.monotonic() + args.timeout
+
+    def remaining() -> float:
+        return max(2.0, deadline - time.monotonic())
+
+    site_args = [args.conversation] + (["--last", "true"] if args.last else [])
+    saved: list[Path] = []
+    # Same tab and lock as a web generation: a second chatgpt.com tab is what
+    # gets the account throttled and lets image toasts leak between runs.
+    with _chatgpt_web_turn(progress, start):
+        try:
+            emit("reading the conversation's images")
+            res = _site_call(ab, "chatgpt/images", site_args, CHATGPT_WEB_SESSION,
+                             timeout=min(60.0, remaining()), profile=args.profile)
+            if not isinstance(res, dict):
+                raise GatewayError(f"unexpected chatgpt/images result: {res!r}"[:300])
+            images = [i for i in res.get("images") or [] if isinstance(i, dict)]
+            if not images:
+                if not res.get("finished", True):
+                    raise GatewayError("ChatGPT is still working on that conversation "
+                                       "and no image is there yet; try again in a minute.")
+                raise GatewayError("that conversation has no generated image.")
+            title = res.get("title") or "recovered"
+            for n, img in enumerate(images, 1):
+                url = img.get("download_url")
+                if not url:
+                    raise GatewayError(f"no download URL for {img.get('file_id')}: "
+                                       f"{img.get('download_error')}")
+                emit(f"downloading image {n}/{len(images)}")
+                got = _ab_eval(ab, _JS_FETCH % json.dumps(url), session=CHATGPT_WEB_SESSION,
+                               timeout=min(60.0, remaining()))
+                if not isinstance(got, dict) or not got.get("ok"):
+                    detail = (got.get("status") or got.get("error")) if isinstance(got, dict) else got
+                    raise GatewayError(f"failed to download {img.get('file_id')}: {detail}")
+                data = base64.b64decode(got["b64"], validate=True)
+                # The signed URL may answer application/octet-stream; trust the bytes.
+                fmt = _fmt_from_mime(_sniff_mime(data)) or _fmt_from_mime(got.get("type")) or "png"
+                if args.out:
+                    out = Path(args.out)
+                    if n > 1:
+                        out = out.with_name(f"{out.stem}-{n}{out.suffix}")
+                else:
+                    out = _default_out_path(title, fmt)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(data)
+                saved.append(out)
+                emit(_green(f"✓ saved → {out}") + _dim(f"  ({len(data):,} bytes)"))
+        except GatewayError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        finally:
+            try:
+                _ab(ab, "close", session=CHATGPT_WEB_SESSION, timeout=15.0)
+            except Exception:
+                pass
+    _record_last_output(saved[-1])
+    for out in saved:
+        print(out)
+    return 0
+
+
 _HELP_EPILOG = """\
 examples:
   image-use "a watercolor cat" -o cat.png
@@ -5740,6 +5893,7 @@ examples:
 subcommands:
   image-use animate PROMPT  generate a 4x2 sprite sheet and encode a loop
   image-use doctor          check which backend is ready (and which auto picks)
+  image-use recover URL     download the image a timed-out web run left in its conversation
   image-use style <verb>    manage reusable style/character assets (alias: styles)
   image-use upgrade         install the latest release (--check, --json; alias: update)
 
@@ -6081,6 +6235,8 @@ def main() -> int:
         return _doctor_command(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ("upgrade", "update"):
         return _upgrade_command(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "recover":
+        return _recover_command(sys.argv[2:])
     argv = sys.argv[1:]
     animate_mode = bool(argv and argv[0] == "animate")
     if animate_mode:
